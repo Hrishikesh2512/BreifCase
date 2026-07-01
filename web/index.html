@@ -60,7 +60,10 @@
       <section class="panel panel-chat">
         <div class="panel-head">
           <h2 id="chat-notebook-name">Chat</h2>
-          <button class="btn btn-ghost btn-sm" id="clear-chat-btn">Clear</button>
+          <div class="panel-head-actions">
+            <button class="btn btn-ghost btn-sm" id="open-draft-btn">📝 Draft</button>
+            <button class="btn btn-ghost btn-sm" id="clear-chat-btn">Clear</button>
+          </div>
         </div>
         <div class="chat-scroll" id="chat-scroll">
           <div class="chat-welcome" id="chat-welcome">
@@ -98,6 +101,45 @@
       </section>
     </main>
   </div>
+
+  <!-- Draft slide-over (hidden until opened; additive, never blocks the rest) -->
+  <aside class="draft-drawer" id="draft-drawer" hidden>
+    <div class="draft-head">
+      <input class="draft-title" id="draft-title" placeholder="Untitled draft" />
+      <div class="draft-head-actions">
+        <span class="draft-saved" id="draft-saved"></span>
+        <button class="btn btn-ghost btn-sm" id="draft-undo" title="Undo the last AI edit">↶ Undo</button>
+        <button class="draft-x" id="draft-close" title="Close">✕</button>
+      </div>
+    </div>
+    <div class="draft-editor-wrap">
+      <textarea class="draft-editor" id="draft-editor" placeholder="Write here, or ask the assistant below to draft from your sources…" spellcheck="false"></textarea>
+      <div class="draft-info" id="draft-info"></div>
+    </div>
+    <form class="draft-cmd" id="draft-cmd-form">
+      <div class="draft-cmd-row">
+        <select id="draft-mode" title="What should the assistant do?">
+          <option value="edit">Edit draft</option>
+          <option value="rewrite">Rewrite selection</option>
+        </select>
+        <input id="draft-cmd" placeholder="e.g. Make it formal, or add a section on X" autocomplete="off" />
+        <button class="btn btn-primary" id="draft-send" type="submit">Send</button>
+      </div>
+      <div class="draft-cmd-tools">
+        <button class="btn btn-ghost btn-sm" id="draft-check" type="button">✓ Check against sources</button>
+        <button class="btn btn-ghost btn-sm" id="draft-import" type="button">⬆ Import file</button>
+        <div class="export-wrap">
+          <button class="btn btn-ghost btn-sm" id="draft-export" type="button">⬇ Export</button>
+          <div class="export-menu" id="draft-export-menu" hidden>
+            <button type="button" data-fmt="md">Markdown (.md)</button>
+            <button type="button" data-fmt="txt">Plain text (.txt)</button>
+            <button type="button" data-fmt="docx">Word (.docx)</button>
+          </div>
+        </div>
+        <input type="file" id="draft-import-input" hidden />
+      </div>
+    </form>
+  </aside>
 
   <!-- Modal -->
   <div class="modal-overlay" id="modal-overlay" hidden>

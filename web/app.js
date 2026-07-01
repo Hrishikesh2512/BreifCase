@@ -76,6 +76,7 @@ function inline(s) {
 
 /* ------------------------- routing ------------------------- */
 function showHome() {
+  closeDraft();
   state.notebook = null;
   el("home-view").hidden = false;
   el("notebook-view").hidden = true;
@@ -84,6 +85,7 @@ function showHome() {
 }
 
 async function openNotebook(id) {
+  closeDraft();
   const nb = await api(`/notebooks/${id}`);
   state.notebook = nb;
   el("home-view").hidden = true;
@@ -132,25 +134,43 @@ async function loadSources() {
   const list = el("source-list");
   const sources = await api(`/notebooks/${state.notebook.id}/sources`);
   state.sources = sources;
-  state.selected = new Set(sources.map((s) => s.id));
-  el("select-all-sources").checked = true;
+  el("select-all-sources").checked = sources.length > 0 && sources.every((s) => s.enabled);
   el("sources-empty").hidden = sources.length > 0;
   list.innerHTML = "";
   for (const s of sources) {
     const item = document.createElement("div");
-    item.className = "source-item";
+    item.className = "source-item" + (s.enabled ? "" : " off");
     item.innerHTML = `
-      <input type="checkbox" checked data-id="${s.id}" />
+      <input type="checkbox" ${s.enabled ? "checked" : ""} data-id="${s.id}" title="Use this source for answers and drafts" />
       <div class="si-main">
-        <div class="si-title" title="${escapeHtml(s.title)}">${escapeHtml(s.title)}</div>
-        <div class="si-meta"><span class="si-type">${s.source_type}</span>${s.chunk_count} chunk${s.chunk_count === 1 ? "" : "s"}</div>
+        <div class="si-title" title="${escapeHtml(s.title)}">${s.is_web ? "🌐 " : ""}${escapeHtml(s.title)}</div>
+        <div class="si-meta"><span class="si-type">${s.is_web ? "web" : s.source_type}</span>${s.chunk_count} chunk${s.chunk_count === 1 ? "" : "s"}</div>
       </div>
+      ${s.is_web ? `<button class="si-refresh" title="Refresh from the web">↻</button>` : ""}
       <button class="si-delete" title="Remove">🗑</button>`;
-    item.querySelector("input").onchange = (e) => {
-      if (e.target.checked) state.selected.add(s.id); else state.selected.delete(s.id);
-      el("select-all-sources").checked = state.selected.size === state.sources.length;
+    item.querySelector("input").onchange = async (e) => {
+      const on = e.target.checked;
+      item.classList.toggle("off", !on);
+      s.enabled = on;
+      el("select-all-sources").checked = state.sources.every((x) => x.enabled);
+      try {
+        await api(`/notebooks/${state.notebook.id}/sources/${s.id}/toggle`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ enabled: on }),
+        });
+      } catch (err) { toast(err.message, "error"); }
     };
     item.querySelector(".si-main").onclick = () => viewSource(s.id);
+    const refreshBtn = item.querySelector(".si-refresh");
+    if (refreshBtn) refreshBtn.onclick = async (e) => {
+      e.stopPropagation();
+      refreshBtn.innerHTML = `<span class="spinner"></span>`;
+      try {
+        const r = await api(`/notebooks/${state.notebook.id}/sources/${s.id}/refresh`, { method: "POST" });
+        toast(`Refreshed from the web (${r.chunk_count} chunks)`, "success");
+      } catch (err) { toast(err.message, "error"); }
+      loadSources();
+    };
     item.querySelector(".si-delete").onclick = async (e) => {
       e.stopPropagation();
       if (!confirm(`Remove "${s.title}"?`)) return;
@@ -162,10 +182,9 @@ async function loadSources() {
   }
 }
 
-function selectedSourceIds() {
-  if (state.selected.size === state.sources.length) return [];
-  return [...state.selected];
-}
+// Queries and drafts run over every enabled source; the server applies the filter,
+// so we send an empty list ("all enabled").
+function selectedSourceIds() { return []; }
 
 async function viewSource(id) {
   const data = await api(`/notebooks/${state.notebook.id}/sources/${id}/text`);
@@ -518,6 +537,160 @@ async function uploadFile(file) {
   } catch (err) { toast(err.message, "error"); }
 }
 
+/* ------------------------- draft (sink) ------------------------- */
+const draft = { saveTimer: null };
+
+async function openDraft() {
+  if (!state.notebook) return;
+  const d = await api(`/notebooks/${state.notebook.id}/draft`);
+  el("draft-title").value = d.title === "Untitled draft" ? "" : d.title;
+  el("draft-editor").value = d.body || "";
+  el("draft-info").innerHTML = "";
+  el("draft-saved").textContent = "";
+  el("draft-drawer").hidden = false;
+  el("draft-editor").focus();
+}
+
+function closeDraft() {
+  if (el("draft-drawer").hidden) return;
+  flushDraftSave();
+  el("draft-drawer").hidden = true;
+}
+
+function scheduleDraftSave() {
+  el("draft-saved").textContent = "editing…";
+  clearTimeout(draft.saveTimer);
+  draft.saveTimer = setTimeout(flushDraftSave, 800);
+}
+
+async function flushDraftSave() {
+  clearTimeout(draft.saveTimer);
+  if (!state.notebook || el("draft-drawer").hidden) return;
+  try {
+    await api(`/notebooks/${state.notebook.id}/draft`, {
+      method: "PUT", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: el("draft-title").value.trim() || "Untitled draft", body: el("draft-editor").value }),
+    });
+    el("draft-saved").textContent = "saved";
+  } catch (e) { el("draft-saved").textContent = "save failed"; }
+}
+
+async function draftSend(e) {
+  if (e) e.preventDefault();
+  const mode = el("draft-mode").value;
+  const command = el("draft-cmd").value.trim();
+  const ed = el("draft-editor");
+  let selection = "";
+  if (mode === "rewrite") {
+    selection = ed.value.substring(ed.selectionStart, ed.selectionEnd).trim();
+    if (!selection) { toast("Select some text in the draft to rewrite", "error"); return; }
+  }
+  if (mode === "write" && !command) { toast("Tell the assistant what to write", "error"); return; }
+  await flushDraftSave();
+  const btn = el("draft-send"); btn.disabled = true; btn.innerHTML = `<span class="spinner"></span>`;
+  el("draft-info").innerHTML = `<p class="draft-note"><span class="spinner"></span> Working…</p>`;
+  try {
+    const edit = await api(`/notebooks/${state.notebook.id}/draft/command`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode, command, selection, source_ids: selectedSourceIds() }),
+    });
+    if (edit.body !== undefined) el("draft-editor").value = edit.body;
+    el("draft-cmd").value = "";
+    renderDraftInfo(edit);
+    el("draft-saved").textContent = "saved";
+  } catch (err) {
+    el("draft-info").innerHTML = `<p class="draft-note warn">${escapeHtml(err.message)}</p>`;
+  }
+  btn.disabled = false; btn.textContent = "Send";
+}
+
+async function draftCheck() {
+  await flushDraftSave();
+  el("draft-info").innerHTML = `<p class="draft-note"><span class="spinner"></span> Checking…</p>`;
+  try {
+    const edit = await api(`/notebooks/${state.notebook.id}/draft/command`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "check", source_ids: selectedSourceIds() }),
+    });
+    renderDraftInfo(edit);
+  } catch (err) { el("draft-info").innerHTML = `<p class="draft-note warn">${escapeHtml(err.message)}</p>`; }
+}
+
+function renderDraftInfo(edit) {
+  let html = "";
+  const hasUnsupported = edit.checks && edit.checks.some((c) => !c.supported);
+  if (edit.note) html += `<p class="draft-note ${hasUnsupported ? "warn" : ""}">${escapeHtml(edit.note)}</p>`;
+  if (edit.checks && edit.checks.length) {
+    html += edit.checks.map((c) => `<div class="check-item ${c.supported ? "ok" : "bad"}">
+      <span class="ci-icon">${c.supported ? "✓" : "✗"}</span>
+      <span>${escapeHtml(c.claim)}${c.supported_by ? ` <span class="ci-src">— ${escapeHtml(c.supported_by)}</span>` : ""}</span></div>`).join("");
+  }
+  if (edit.citations && edit.citations.length) {
+    html += `<div class="citations">` + edit.citations.map((c) => `
+      <div class="citation-card"><div class="cc-head"><span class="cc-num">[${c.marker}]</span>
+      <span class="cc-title">${escapeHtml(c.source_title)}</span></div>
+      <div class="cc-quote">"${escapeHtml(c.quote)}"</div></div>`).join("") + `</div>`;
+  }
+  el("draft-info").innerHTML = html;
+}
+
+function draftFilename(ext) {
+  const t = (el("draft-title").value.trim() || "draft").replace(/[^\w\- ]+/g, "").trim() || "draft";
+  return `${t}.${ext}`;
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function draftExport(fmt) {
+  el("draft-export-menu").hidden = true;
+  if (fmt === "md" || fmt === "txt") {
+    const mime = fmt === "md" ? "text/markdown" : "text/plain";
+    downloadBlob(new Blob([el("draft-editor").value], { type: mime }), draftFilename(fmt));
+    return;
+  }
+  if (fmt === "docx") {
+    await flushDraftSave(); // server builds from the saved body
+    try {
+      const res = await fetch(`${API}/notebooks/${state.notebook.id}/draft/export.docx`);
+      if (!res.ok) throw new Error("Export failed");
+      downloadBlob(await res.blob(), draftFilename("docx"));
+    } catch (err) { toast(err.message, "error"); }
+  }
+}
+
+async function draftImport(file) {
+  const form = new FormData();
+  form.append("file", file);
+  el("draft-info").innerHTML = `<p class="draft-note"><span class="spinner"></span> Importing ${escapeHtml(file.name)}…</p>`;
+  try {
+    const d = await api(`/notebooks/${state.notebook.id}/draft/import`, { method: "POST", body: form });
+    el("draft-editor").value = d.body || "";
+    el("draft-info").innerHTML = "";
+    el("draft-saved").textContent = "saved";
+    toast("Imported into draft", "success");
+  } catch (err) {
+    el("draft-info").innerHTML = `<p class="draft-note warn">${escapeHtml(err.message)}</p>`;
+  }
+}
+
+async function draftUndo() {
+  const versions = await api(`/notebooks/${state.notebook.id}/draft/versions`);
+  if (!versions.length) { toast("Nothing to undo", "error"); return; }
+  const d = await api(`/notebooks/${state.notebook.id}/draft/restore`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ version_id: versions[0].id }),
+  });
+  el("draft-editor").value = d.body || "";
+  el("draft-info").innerHTML = "";
+  toast("Reverted to previous version", "success");
+}
+
 /* ------------------------- input wiring ------------------------- */
 function sendFromInput() {
   const box = el("chat-text");
@@ -539,10 +712,17 @@ function wire() {
   el("url-btn").onclick = addUrlModal;
   el("text-btn").onclick = addTextModal;
 
-  el("select-all-sources").onchange = (e) => {
+  el("select-all-sources").onchange = async (e) => {
     const on = e.target.checked;
-    state.selected = on ? new Set(state.sources.map((s) => s.id)) : new Set();
-    el("source-list").querySelectorAll("input[type=checkbox]").forEach((c) => (c.checked = on));
+    el("source-list").querySelectorAll(".source-item").forEach((it) => it.classList.toggle("off", !on));
+    el("source-list").querySelectorAll('input[type="checkbox"]').forEach((c) => (c.checked = on));
+    await Promise.all(state.sources.map((s) => {
+      s.enabled = on;
+      return api(`/notebooks/${state.notebook.id}/sources/${s.id}/toggle`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ enabled: on }),
+      }).catch(() => {});
+    }));
   };
 
   el("chat-form").onsubmit = (e) => { e.preventDefault(); sendFromInput(); };
@@ -557,7 +737,20 @@ function wire() {
   el("summary-btn").onclick = generateSummary;
   el("questions-btn").onclick = suggestQuestions;
 
-  document.onkeydown = (e) => { if (e.key === "Escape") closeModal(); };
+  el("open-draft-btn").onclick = openDraft;
+  el("draft-close").onclick = closeDraft;
+  el("draft-cmd-form").onsubmit = draftSend;
+  el("draft-check").onclick = draftCheck;
+  el("draft-undo").onclick = draftUndo;
+  el("draft-import").onclick = () => el("draft-import-input").click();
+  el("draft-import-input").onchange = (e) => { if (e.target.files[0]) draftImport(e.target.files[0]); e.target.value = ""; };
+  el("draft-export").onclick = (e) => { e.stopPropagation(); el("draft-export-menu").hidden = !el("draft-export-menu").hidden; };
+  el("draft-export-menu").querySelectorAll("button").forEach((b) => { b.onclick = () => draftExport(b.dataset.fmt); });
+  document.addEventListener("click", () => { el("draft-export-menu").hidden = true; });
+  el("draft-editor").oninput = scheduleDraftSave;
+  el("draft-title").onchange = flushDraftSave;
+
+  document.onkeydown = (e) => { if (e.key === "Escape") { closeModal(); closeDraft(); } };
 }
 
 async function loadStatus() {

@@ -21,6 +21,8 @@ class Source(BaseModel):
     origin: str = ""  # filename or URL
     chunk_count: int = 0
     token_count: int = 0
+    enabled: bool = True
+    is_web: bool = False
     created_at: datetime
 
 
@@ -31,6 +33,12 @@ class Citation(BaseModel):
     chunk_id: str
     ordinal: int
     quote: str
+
+
+class ClaimCheck(BaseModel):
+    claim: str
+    supported: bool
+    supported_by: str | None = None
 
 
 class RetrievedChunk(BaseModel):
@@ -76,3 +84,41 @@ class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
     source_ids: list[str] = Field(default_factory=list)  # empty = all sources
     top_k: int | None = None
+
+
+# ---- Draft (sink) ----
+
+
+class Draft(BaseModel):
+    id: str
+    notebook_id: str
+    title: str
+    body: str
+    updated_at: datetime
+
+
+class DraftVersion(BaseModel):
+    id: str
+    note: str
+    created_at: datetime
+
+
+class SaveDraft(BaseModel):
+    title: str | None = Field(default=None, max_length=300)
+    body: str | None = None
+
+
+class DraftCommand(BaseModel):
+    mode: str = "write"  # write | rewrite | check
+    command: str = Field(default="", max_length=4000)
+    selection: str = ""  # text the user selected (for rewrite)
+    source_ids: list[str] = Field(default_factory=list)
+
+
+class DraftEdit(BaseModel):
+    """Result of an AI command: a proposed new body plus what changed."""
+    body: str
+    citations: list[Citation] = Field(default_factory=list)
+    engine: str = "extractive"
+    note: str = ""
+    checks: list[ClaimCheck] = Field(default_factory=list)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, File, HTTPException, Response, UploadFile, status
 
 from briefcase import repository as repo
 from briefcase.ingest.parsers import supported_extensions
@@ -13,9 +13,15 @@ from briefcase.models import (
     Answer,
     ChatRequest,
     CreateNotebook,
+    Draft,
+    DraftCommand,
+    DraftEdit,
+    DraftVersion,
     Notebook,
+    SaveDraft,
     Source,
 )
+from briefcase.rag.author import DraftAuthor
 from briefcase.rag.generator import AnswerGenerator
 from briefcase.rag.llm import OllamaClient, llm_status
 from briefcase.rag import studio
@@ -26,6 +32,7 @@ router = APIRouter(prefix="/api")
 
 _ingestion = IngestionService()
 _generator = AnswerGenerator()
+_author = DraftAuthor()
 
 
 # ---------------- system ----------------
@@ -212,6 +219,23 @@ def delete_source(notebook_id: str, source_id: str) -> None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Source not found")
 
 
+@router.post("/notebooks/{notebook_id}/sources/{source_id}/toggle")
+def toggle_source(notebook_id: str, source_id: str, payload: dict) -> dict:
+    enabled = bool((payload or {}).get("enabled", True))
+    if not repo.toggle_source(notebook_id, source_id, enabled):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Source not found")
+    return {"source_id": source_id, "enabled": enabled}
+
+
+@router.post("/notebooks/{notebook_id}/sources/{source_id}/refresh")
+def refresh_source(notebook_id: str, source_id: str) -> dict:
+    try:
+        count = _ingestion.refresh_source(notebook_id, source_id)
+    except IngestionError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    return {"source_id": source_id, "chunk_count": count}
+
+
 # ---------------- chat / studio ----------------
 
 
@@ -238,3 +262,130 @@ def questions(notebook_id: str, payload: dict | None = None) -> dict:
     _require_notebook(notebook_id)
     source_ids = (payload or {}).get("source_ids") or None
     return studio.suggested_questions(notebook_id, source_ids)
+
+
+# ---------------- draft (sink) ----------------
+
+
+@router.get("/notebooks/{notebook_id}/draft", response_model=Draft)
+def get_draft(notebook_id: str) -> Draft:
+    _require_notebook(notebook_id)
+    return Draft(**repo.get_or_create_draft(notebook_id))
+
+
+@router.put("/notebooks/{notebook_id}/draft", response_model=Draft)
+def save_draft(notebook_id: str, payload: SaveDraft) -> Draft:
+    _require_notebook(notebook_id)
+    return Draft(**repo.save_draft(notebook_id, title=payload.title, body=payload.body))
+
+
+@router.post("/notebooks/{notebook_id}/draft/command", response_model=DraftEdit)
+def draft_command(notebook_id: str, payload: DraftCommand) -> DraftEdit:
+    _require_notebook(notebook_id)
+    body = repo.get_or_create_draft(notebook_id)["body"]
+    source_ids = payload.source_ids or None
+    if payload.mode in ("edit", "write"):
+        edit = _author.edit(notebook_id, payload.command, body, source_ids=source_ids)
+    elif payload.mode == "rewrite":
+        edit = _author.rewrite(notebook_id, payload.command, payload.selection, body, source_ids=source_ids)
+    elif payload.mode == "check":
+        edit = _author.check(notebook_id, body, source_ids=source_ids)
+    else:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Unknown mode: {payload.mode}")
+
+    # Persist body-changing edits with an undo snapshot; 'check' never changes the body.
+    if payload.mode in ("edit", "write", "rewrite") and edit.body != body:
+        repo.save_draft(notebook_id, body=edit.body, snapshot_note=f"before {payload.mode}")
+    return edit
+
+
+@router.post("/notebooks/{notebook_id}/draft/import", response_model=Draft)
+async def import_into_draft(notebook_id: str, file: UploadFile = File(...)) -> Draft:
+    """Seed the draft (sink) from an uploaded file: text, PDF, DOCX, PPTX, Markdown,
+    HTML, code, or a scanned/image file (via OCR)."""
+    _require_notebook(notebook_id)
+    from briefcase.ingest.parsers import ParserError, parse
+
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "The uploaded file is empty.")
+    try:
+        doc = parse(payload, filename=file.filename or "import")
+    except ParserError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Could not read '{file.filename}': {type(exc).__name__}.",
+        ) from exc
+    existing = repo.get_or_create_draft(notebook_id)["body"]
+    new_body = f"{existing.rstrip()}\n\n{doc.text}".strip() if existing.strip() else doc.text
+    return Draft(**repo.save_draft(notebook_id, body=new_body, snapshot_note="before import"))
+
+
+def _safe_filename(name: str, ext: str) -> str:
+    import re as _re
+
+    stem = _re.sub(r'[^\w\- ]+', "", name).strip() or "draft"
+    return f"{stem}.{ext}"
+
+
+@router.get("/notebooks/{notebook_id}/draft/export.docx")
+def export_draft_docx(notebook_id: str) -> Response:
+    """Export the draft as a Word document (minimal Markdown -> docx conversion)."""
+    import io
+    import re
+
+    from docx import Document
+
+    _require_notebook(notebook_id)
+    draft = repo.get_or_create_draft(notebook_id)
+
+    def add_md(doc, text: str, style=None) -> None:
+        para = doc.add_paragraph(style=style)
+        for i, part in enumerate(re.split(r"\*\*(.+?)\*\*", text)):
+            run = para.add_run(part)
+            if i % 2 == 1:
+                run.bold = True
+
+    document = Document()
+    document.add_heading(draft["title"] or "Draft", level=0)
+    for raw in draft["body"].split("\n"):
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        if line.startswith("### "):
+            document.add_heading(line[4:], level=3)
+        elif line.startswith("## "):
+            document.add_heading(line[3:], level=2)
+        elif line.startswith("# "):
+            document.add_heading(line[2:], level=1)
+        elif line.lstrip().startswith(("- ", "* ")):
+            add_md(document, line.lstrip()[2:], style="List Bullet")
+        else:
+            add_md(document, line)
+
+    buf = io.BytesIO()
+    document.save(buf)
+    filename = _safe_filename(draft["title"], "docx")
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/notebooks/{notebook_id}/draft/versions", response_model=list[DraftVersion])
+def draft_versions(notebook_id: str) -> list[DraftVersion]:
+    _require_notebook(notebook_id)
+    return [DraftVersion(**v) for v in repo.list_draft_versions(notebook_id)]
+
+
+@router.post("/notebooks/{notebook_id}/draft/restore", response_model=Draft)
+def restore_draft(notebook_id: str, payload: dict) -> Draft:
+    _require_notebook(notebook_id)
+    version_id = (payload or {}).get("version_id")
+    result = repo.restore_draft_version(notebook_id, version_id or "")
+    if result is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Version not found")
+    return Draft(**result)

@@ -44,6 +44,8 @@ class GeminiClient:
         self.name = f"gemini:{self._model}"
 
     def complete(self, prompt: str, *, system: str | None = None) -> str:
+        import time
+
         from google.genai import types
 
         config = types.GenerateContentConfig(
@@ -51,10 +53,24 @@ class GeminiClient:
             max_output_tokens=self._cfg.max_tokens,
             system_instruction=system,
         )
-        resp = self._client.models.generate_content(
-            model=self._model, contents=prompt, config=config
-        )
-        return (resp.text or "").strip()
+        last: Exception | None = None
+        for attempt in range(3):
+            try:
+                resp = self._client.models.generate_content(
+                    model=self._model, contents=prompt, config=config
+                )
+                return (resp.text or "").strip()
+            except Exception as exc:  # retry transient 5xx / overload / rate limits
+                last = exc
+                msg = str(exc)
+                transient = any(t in msg for t in (
+                    "ServerError", "500", "502", "503", "UNAVAILABLE", "overloaded",
+                    "RESOURCE_EXHAUSTED", "429", "deadline", "timeout",
+                ))
+                if not transient or attempt == 2:
+                    raise
+                time.sleep(1.5 * (attempt + 1))
+        raise last  # pragma: no cover
 
 
 class OllamaClient:
